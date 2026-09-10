@@ -46,6 +46,7 @@ dependencies {
     // assina transação nenhuma, só verifica assinatura de manifesto), sem work-runtime.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.getstream:stream-webrtc-android:1.2.1")
+implementation("org.web3j:core:4.8.8-android")
     implementation("net.i2p.crypto:eddsa:0.3.0")
     // usado só pra decodificar a chave pública do dono do site (Base58 -> bytes)
     implementation("org.sol4k:sol4k:0.8.2")
