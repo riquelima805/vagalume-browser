@@ -13,6 +13,7 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import com.decentstorage.app.StorageClient
 import com.decentstorage.app.network.GossipRegistry
+import com.decentstorage.app.network.NodeIdentity
 import com.decentstorage.app.network.RelayConfig
 import com.decentstorage.app.network.ShardRequestHandler
 import com.decentstorage.app.network.webrtc.WebRtcManager
@@ -87,14 +88,30 @@ class BrowserActivity : ComponentActivity() {
     }
 
     private fun connectSignaling(signalingUrl: String, nodeId: String, reg: GossipRegistry, reqHandler: ShardRequestHandler) {
+        // Desde o patch anti-hijack de nodeId no signaling, TODO register de
+        // peer não-infra precisa provar posse via assinatura Ed25519
+        // (pubkey+sig) — sem isso o servidor responde 'register_unauthorized'
+        // e o app fica pra sempre com 0 peers, sem nenhum aviso. A identidade
+        // aqui é local ao app (gerada uma vez, guardada em SharedPreferences),
+        // não é a wallet do usuário — só prova "sou sempre o mesmo dono deste
+        // nodeId entre sessões", que é tudo que o signaling exige.
+        val identity = NodeIdentity.load(applicationContext)
+
         val sc = SignalingClient(
             signalingUrl,
             nodeId,
             onSignal = { _, _ -> },
             onStateChange = { connected ->
                 runOnUiThread { statusText.text = if (connected) "conectado à rede (${reg.knownPeers().size} peer(s))" else "desconectado do signaling" }
-            }
+            },
+            walletPubkeyBase58 = identity.pubkeyBase58,
+            signNodeId = identity.sign
         )
+        sc.onError = { reason, detail ->
+            runOnUiThread {
+                statusText.text = "erro do signaling: $reason" + (detail?.let { " — $it" } ?: "")
+            }
+        }
 
         val mgr = WebRtcManager(
             context = this,
