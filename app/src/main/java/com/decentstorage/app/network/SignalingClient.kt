@@ -32,7 +32,13 @@ class SignalingClient(
 
     var onPeerList: ((List<String>) -> Unit)? = null
     var onPeerJoined: ((String) -> Unit)? = null
-    var onPeerLeft: ((String) -> Unit)? = null 
+    var onPeerLeft: ((String) -> Unit)? = null
+    // Antes, 'error'/'relay_error' eram só engolidos (case vazio) — se o
+    // servidor rejeitasse o register (nodeId inválido, assinatura exigida
+    // ausente, rate limit etc.), o app continuava mostrando "conectado" pra
+    // sempre, sem nenhum peer, sem explicação nenhuma. Agora quem cria o
+    // client pode mostrar isso pro usuário.
+    var onError: ((reason: String, detail: String?) -> Unit)? = null
 
     fun connect() {
         val request = Request.Builder().url(serverUrl).build()
@@ -89,8 +95,10 @@ class SignalingClient(
                         onRelayResponse?.invoke(from, reqId, header, payload)
                     }
 
-                    "error", "relay_error" -> { 
-                        
+                    "error", "relay_error" -> {
+                        val reason = msg.optString("reason", "erro_desconhecido")
+                        val detail = msg.optString("detail", "").takeIf { it.isNotEmpty() }
+                        onError?.invoke(reason, detail)
                     }
                 }
             }
