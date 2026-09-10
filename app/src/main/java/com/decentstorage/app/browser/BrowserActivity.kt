@@ -124,16 +124,24 @@ class BrowserActivity : ComponentActivity() {
         )
         sc.onSignal = { from, payload -> mgr.handleSignal(from, payload) }
 
+        // O navegador NUNCA precisa esperar ser chamado — ele só consome
+        // (capacidade 0, nunca serve nada pra ninguém). A checagem "só
+        // inicia se meu nodeId < peerId" existe pra evitar dois NÓS REAIS
+        // discando um pro outro ao mesmo tempo (glare no WebRTC), mas como
+        // nodeId aqui sempre começa com "browser-" (baixo na ordem
+        // alfabética), essa checagem podia fazer o navegador nunca discar
+        // pro node — e o node, por sua vez, nunca disca pro navegador (só
+        // se importa com outros nós reais). Resultado: WebRTC nunca
+        // conectava, o navegador nunca recebia gossip nenhum, e por isso
+        // nenhum site aparecia nunca, mesmo com o signaling funcionando.
         sc.onPeerList = { peerIds ->
             peerIds.filter { it != nodeId }.forEach { peerId ->
-                if (nodeId < peerId) {
-                    mgr.connectToPeer(peerId)
-                    scheduleRelayFallback(peerId, reg, sc)
-                }
+                mgr.connectToPeer(peerId)
+                scheduleRelayFallback(peerId, reg, sc)
             }
         }
         sc.onPeerJoined = { peerId ->
-            if (peerId != nodeId && nodeId < peerId) {
+            if (peerId != nodeId) {
                 mgr.connectToPeer(peerId)
                 scheduleRelayFallback(peerId, reg, sc)
             }
