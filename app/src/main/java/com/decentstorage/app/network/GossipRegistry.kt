@@ -8,7 +8,7 @@ import net.i2p.crypto.eddsa.spec.EdDSANamedCurveTable
 import net.i2p.crypto.eddsa.spec.EdDSAPublicKeySpec
 import org.json.JSONArray
 import org.json.JSONObject
-import org.sol4k.PublicKey
+import org.sol4k.Base58
 import java.io.File
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
