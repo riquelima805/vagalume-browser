@@ -15,7 +15,7 @@ import com.decentstorage.app.StorageClient
 import com.decentstorage.app.network.GossipRegistry
 import com.decentstorage.app.network.RelayConfig
 import com.decentstorage.app.network.ShardRequestHandler
-import com.decentstorage.app.network.WebRtcManager
+import com.decentstorage.app.network.webrtc.WebRtcManager
 import com.decentstorage.app.network.webrtc.RelayTransport
 import com.decentstorage.app.network.webrtc.SignalingClient
 import org.json.JSONObject
