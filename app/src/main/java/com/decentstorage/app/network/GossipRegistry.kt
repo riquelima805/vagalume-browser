@@ -202,7 +202,7 @@ class GossipRegistry(
         return try {
             val message = canonicalManifest(domain, routes).toByteArray(Charsets.UTF_8)
             val sig = Base64.getDecoder().decode(signatureB64)
-            val pubkeyBytes = PublicKey(ownerPubkeyB58).bytes
+          val pubkeyBytes = Base58.decode(ownerPubkeyB58)
             val spec = EdDSANamedCurveTable.getByName(EdDSANamedCurveTable.ED_25519)
             val pub = EdDSAPublicKey(EdDSAPublicKeySpec(pubkeyBytes, spec))
             val engine = EdDSAEngine()
