@@ -4,7 +4,6 @@ on:
   push:
     branches: [ "main", "master" ]
 
-# Permissão necessária para o GitHub Actions criar Releases na seção do repositório
 permissions:
   contents: write
 
@@ -22,14 +21,15 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
+      # Baixa e instala o Gradle 8.7 diretamente na maquina virtual do GitHub
+      - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
 
-      - name: Make gradlew executable
-        run: chmod +x gradlew
-
+      # Executa o Gradle do sistema (sem depender de gradlew ou wrapper no repositório)
       - name: Build Debug APK
-        run: ./gradlew assembleDebug
+        run: gradle assembleDebug
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
