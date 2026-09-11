@@ -1,6 +1,7 @@
 package com.decentstorage.app.browser
 
 import android.os.Bundle
+import android.util.Log
 import android.view.Gravity
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -38,6 +39,8 @@ import kotlin.concurrent.thread
  * e WebRTC direto com eles (pra baixar shards).
  */
 class BrowserActivity : ComponentActivity() {
+
+    companion object { private const val TAG = "VagalunBrowser" }
 
     private lateinit var registry: GossipRegistry
     private lateinit var storageClient: StorageClient
@@ -96,18 +99,21 @@ class BrowserActivity : ComponentActivity() {
         // não é a wallet do usuário — só prova "sou sempre o mesmo dono deste
         // nodeId entre sessões", que é tudo que o signaling exige.
         val identity = NodeIdentity.load(applicationContext)
+        Log.d(TAG, "conectando ao signaling $signalingUrl como $nodeId (pubkey=${identity.pubkeyBase58})")
 
         val sc = SignalingClient(
             signalingUrl,
             nodeId,
             onSignal = { _, _ -> },
             onStateChange = { connected ->
+                Log.d(TAG, "onStateChange connected=$connected peers=${reg.knownPeers().size}")
                 runOnUiThread { statusText.text = if (connected) "conectado à rede (${reg.knownPeers().size} peer(s))" else "desconectado do signaling" }
             },
             walletPubkeyBase58 = identity.pubkeyBase58,
             signNodeId = identity.sign
         )
         sc.onError = { reason, detail ->
+            Log.e(TAG, "signaling onError reason=$reason detail=$detail")
             runOnUiThread {
                 statusText.text = "erro do signaling: $reason" + (detail?.let { " — $it" } ?: "")
             }
@@ -118,8 +124,8 @@ class BrowserActivity : ComponentActivity() {
             signalingClient = sc,
             selfNodeId = nodeId,
             requestHandler = reqHandler,
-            onTransportReady = { peerId, transport -> reg.attachWanTransport(peerId, transport) },
-            onTransportClosed = { peerId -> reg.detachWanTransport(peerId) },
+            onTransportReady = { peerId, transport -> Log.d(TAG, "WebRTC pronto com $peerId"); reg.attachWanTransport(peerId, transport) },
+            onTransportClosed = { peerId -> Log.d(TAG, "WebRTC fechado com $peerId"); reg.detachWanTransport(peerId) },
             iceServers = WebRtcManager.defaultIceServers()
         )
         sc.onSignal = { from, payload -> mgr.handleSignal(from, payload) }
@@ -135,18 +141,20 @@ class BrowserActivity : ComponentActivity() {
         // conectava, o navegador nunca recebia gossip nenhum, e por isso
         // nenhum site aparecia nunca, mesmo com o signaling funcionando.
         sc.onPeerList = { peerIds ->
+            Log.d(TAG, "onPeerList: $peerIds")
             peerIds.filter { it != nodeId }.forEach { peerId ->
                 mgr.connectToPeer(peerId)
                 scheduleRelayFallback(peerId, reg, sc)
             }
         }
         sc.onPeerJoined = { peerId ->
+            Log.d(TAG, "onPeerJoined: $peerId")
             if (peerId != nodeId) {
                 mgr.connectToPeer(peerId)
                 scheduleRelayFallback(peerId, reg, sc)
             }
         }
-        sc.onPeerLeft = { peerId -> mgr.disconnect(peerId); reg.detachWanTransport(peerId) }
+        sc.onPeerLeft = { peerId -> Log.d(TAG, "onPeerLeft: $peerId"); mgr.disconnect(peerId); reg.detachWanTransport(peerId) }
 
         sc.onRelayRequest = { from, requestId, header, payload ->
             val (respHeader, respPayload) = try {
@@ -185,10 +193,8 @@ class BrowserActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         val goButton = Button(this).apply { text = "Ir" }
-        val debugButton = Button(this).apply { text = "🔍" }
         addressBar.addView(domainField)
         addressBar.addView(goButton)
-        addressBar.addView(debugButton)
 
         statusText = TextView(this).apply { text = "conectando..."; setPadding(16, 0, 16, 8) }
 
@@ -199,9 +205,9 @@ class BrowserActivity : ComponentActivity() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val domain = currentDomain ?: return super.shouldInterceptRequest(view, request)
                     val path = request.url.path?.takeIf { it.isNotEmpty() } ?: "/"
-                    val result = resolveAndFetch(domain, path)
-                    if (result !is FetchResult.Success) return null
-                    return WebResourceResponse(result.contentType, "utf-8", ByteArrayInputStream(result.bytes))
+                    return resolveAndFetch(domain, path)?.let { (bytes, contentType) ->
+                        WebResourceResponse(contentType, "utf-8", ByteArrayInputStream(bytes))
+                    }
                 }
             }
         }
@@ -215,82 +221,42 @@ class BrowserActivity : ComponentActivity() {
             val domain = domainField.text.toString().trim()
             if (domain.isNotEmpty()) navigateTo(domain)
         }
-
-        debugButton.setOnClickListener { showDebugInfo() }
-    }
-
-    // Painel de diagnóstico: mostra exatamente o que o registry sabe agora —
-    // quem são os peers (e se cada um tem transporte WebRTC ativo ou só
-    // relay/nenhum) e quais domínios já foram aprendidos via gossip. Sem
-    // isso, "não achei o site" é uma caixa preta — com isso dá pra saber
-    // na hora se é falta de peer, peer sem WebRTC de verdade, ou o domínio
-    // realmente nunca chegou.
-    private fun showDebugInfo() {
-        val peersInfo = registry.knownPeers().joinToString("\n") { p ->
-            val transporte = when {
-                p.webrtcTransport != null -> "webrtc ✅"
-                else -> "sem transporte ❌ (só apareceu via gossip de outro peer, nunca conectou direto)"
-            }
-            "• ${p.nodeId} — alive=${p.alive} — $transporte"
-        }.ifEmpty { "(nenhum peer conhecido)" }
-
-        val sitesInfo = registry.listSites().joinToString("\n") { "• $it" }.ifEmpty { "(nenhum site conhecido ainda)" }
-
-        val msg = "PEERS (${registry.knownPeers().size}):\n$peersInfo\n\nSITES CONHECIDOS (${registry.listSites().size}):\n$sitesInfo"
-
-        android.app.AlertDialog.Builder(this)
-            .setTitle("Debug — estado do gossip")
-            .setMessage(msg)
-            .setPositiveButton("Fechar", null)
-            .show()
     }
 
     private fun navigateTo(domain: String) {
         currentDomain = domain
-        val result = resolveAndFetch(domain, "/")
-        if (result is FetchResult.Failure) {
-            statusText.text = result.reason
+        val (bytes, contentType) = resolveAndFetch(domain, "/") ?: run {
+            statusText.text = "não achei '$domain' no índice ainda (${registry.knownPeers().size} peer(s) conectados — " +
+                "gossip pode levar alguns segundos, ou o site nunca foi anunciado)"
             webView.loadData("", "text/plain", "utf-8")
             return
         }
-        result as FetchResult.Success
         statusText.text = "servido 100% via P2P — nenhuma requisição HTTP/DNS normal foi feita"
-        if (result.contentType.startsWith("text/html")) {
-            webView.loadDataWithBaseURL("https://$domain/", String(result.bytes, Charsets.UTF_8), result.contentType, "utf-8", null)
+        if (contentType.startsWith("text/html")) {
+            webView.loadDataWithBaseURL("https://$domain/", String(bytes, Charsets.UTF_8), contentType, "utf-8", null)
         } else {
-            webView.loadData(Base64.getEncoder().encodeToString(result.bytes), result.contentType, "base64")
+            webView.loadData(Base64.getEncoder().encodeToString(bytes), contentType, "base64")
         }
     }
 
-    // Antes as 3 causas de falha (site não existe no índice / rota não existe
-    // no manifesto / download do shard falhou) viravam a MESMA mensagem
-    // genérica "não achei" — impossível saber qual das três era sem debugar
-    // o app. Agora cada uma fala exatamente o que aconteceu.
-    private sealed class FetchResult {
-        data class Success(val bytes: ByteArray, val contentType: String) : FetchResult()
-        data class Failure(val reason: String) : FetchResult()
-    }
-
-    private fun resolveAndFetch(domain: String, path: String): FetchResult {
-        val site = registry.getSite(domain)
-            ?: return FetchResult.Failure(
-                "não achei '$domain' no índice (${registry.knownPeers().size} peer(s) conectados — " +
-                    "gossip pode levar alguns segundos, ou o site nunca foi anunciado/o domínio está diferente do publicado)"
-            )
-
-        val route = site.routes.find { it.path == path } ?: site.routes.find { it.path == "/" }
-            ?: return FetchResult.Failure("achei o site '$domain', mas o manifesto não tem nenhuma rota pra '$path' nem '/'")
-
+    private fun resolveAndFetch(domain: String, path: String): Pair<ByteArray, String>? {
+        val known = registry.listSites()
+        Log.d(TAG, "resolveAndFetch domain=$domain path=$path — sites conhecidos agora (${known.size}): $known")
+        val site = registry.getSite(domain) ?: run {
+            Log.d(TAG, "getSite($domain) retornou null — não está no índice local ainda")
+            return null
+        }
+        Log.d(TAG, "site encontrado: $domain com ${site.routes.size} rota(s)")
+        val route = site.routes.find { it.path == path } ?: site.routes.find { it.path == "/" } ?: run {
+            Log.d(TAG, "nenhuma rota bate com path=$path nem com '/' — rotas: ${site.routes.map { it.path }}")
+            return null
+        }
         return try {
             val fileKey = Base64.getDecoder().decode(route.fileKeyB64)
-            val bytes = storageClient.downloadFileWithKey(route.fileId, fileKey)
-            FetchResult.Success(bytes, route.contentType)
+            storageClient.downloadFileWithKey(route.fileId, fileKey) to route.contentType
         } catch (e: Exception) {
-            FetchResult.Failure(
-                "achei o manifesto de '$domain', mas falhou baixar o arquivo (fileId=${route.fileId.take(8)}...): " +
-                    "${e.javaClass.simpleName}: ${e.message} — provavelmente nenhum peer conectado agora tem os shards " +
-                    "desse arquivo (k mínimo de blocos não disponível)"
-            )
+            Log.e(TAG, "falha ao baixar fileId=${route.fileId} via P2P", e)
+            null
         }
     }
 
