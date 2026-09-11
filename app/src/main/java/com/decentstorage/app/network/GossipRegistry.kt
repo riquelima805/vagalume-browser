@@ -59,6 +59,11 @@ class GossipRegistry(
         var placements: MutableList<Placement>
     )
 
+    // updatedAt: mesma ideia do SiteMeta.updatedAt — sem isso, mergeFiles() só
+    // aceitava um fileId na PRIMEIRA vez que o via e travava o placement pra
+    // sempre (nem re-publicar/backfillar de novo no gateway resolvia, porque
+    // `files.containsKey(fileId)` já dava true e o `continue` matava o merge
+    // antes de olhar pro conteúdo novo). Ver comentário em mergeFiles().
     data class FileMeta(
         val fileId: String,
         val fileName: String,
@@ -67,7 +72,8 @@ class GossipRegistry(
         val n: Int,
         val blockSize: Int,
         val originalLength: Int,
-        var blocks: MutableList<BlockMeta>
+        var blocks: MutableList<BlockMeta>,
+        var updatedAt: Long = System.currentTimeMillis()
     )
 
     // --- Índice de sites (navegador P2P) ---
@@ -94,6 +100,12 @@ class GossipRegistry(
     private val executor = Executors.newSingleThreadScheduledExecutor()
 
     private val ALIVE_TIMEOUT_MS = 15_000L
+
+    // Hook opcional pra debug embutido no app (ver DebugLog.kt / BrowserActivity).
+    // Não afeta em nada quem não setar isso (app-node principal não usa).
+    var onEvent: ((String) -> Unit)? = null
+    private fun emit(msg: String) { onEvent?.invoke(msg) }
+    fun logDebug(msg: String) = emit(msg) // usado por StorageClient.kt (fora desta classe) pra registrar falha/sucesso de download
 
     // --- Persistência em disco (mesmo padrão do gateway-data.json) ---
     private val dataFile: File? = dataDir?.let { File(it, "gossip-registry.json") }
@@ -186,7 +198,11 @@ class GossipRegistry(
         peers[nodeId]?.webrtcTransport = null
     }
 
-    fun registerFile(meta: FileMeta) { files[meta.fileId] = meta; scheduleSave() }
+    fun registerFile(meta: FileMeta) {
+        meta.updatedAt = System.currentTimeMillis()
+        files[meta.fileId] = meta
+        scheduleSave()
+    }
     fun getFile(fileId: String): FileMeta? = files[fileId]
     fun knownPeers(): List<PeerInfo> = peers.values.toList()
 
@@ -271,11 +287,14 @@ class GossipRegistry(
                 .put("peers", serializePeers())
                 .put("files", serializeFiles())
                 .put("sites", serializeSites())
+            emit("GOSSIP -> ${peer.nodeId}\nENVIADO: ${payload}")
             val response = peer.transport.gossip(payload)
             if (response == null) {
                 android.util.Log.d("VagalunGossip", "gossip com ${peer.nodeId} retornou null (transporte falhou/timeout)")
+                emit("GOSSIP -> ${peer.nodeId}: SEM RESPOSTA (timeout/transporte falhou)")
                 continue
             }
+            emit("GOSSIP -> ${peer.nodeId}\nRECEBIDO: ${response}")
             mergePeers(response.optJSONArray("peers") ?: JSONArray())
             mergeFiles(response.optJSONArray("files") ?: JSONArray())
             mergeSites(response.optJSONArray("sites") ?: JSONArray())
@@ -284,10 +303,13 @@ class GossipRegistry(
     }
 
     fun handleIncomingGossip(payload: JSONObject): JSONObject {
+        emit("GOSSIP <- recebido de fora\nRECEBIDO: ${payload}")
         mergePeers(payload.optJSONArray("peers") ?: JSONArray())
         mergeFiles(payload.optJSONArray("files") ?: JSONArray())
         mergeSites(payload.optJSONArray("sites") ?: JSONArray())
-        return JSONObject().put("peers", serializePeers()).put("files", serializeFiles()).put("sites", serializeSites())
+        val resp = JSONObject().put("peers", serializePeers()).put("files", serializeFiles()).put("sites", serializeSites())
+        emit("GOSSIP <- respondendo\nENVIADO: ${resp}")
+        return resp
     }
 
     private fun serializeSites(): JSONArray {
@@ -376,17 +398,29 @@ class GossipRegistry(
                     .put("k", f.k).put("m", f.m).put("n", f.n)
                     .put("blockSize", f.blockSize).put("originalLength", f.originalLength)
                     .put("blocks", blocksArr)
+                    .put("updatedAt", f.updatedAt)
             )
         }
         return arr
     }
 
+    // ANTES: `if (files.containsKey(fileId)) continue` travava o placement pra
+    // sempre na primeira versão aprendida — nem republicar no gateway e rodar o
+    // backfill de novo adiantava, porque esse `continue` matava o merge antes
+    // de sequer olhar o conteúdo novo. Agora, mesma lógica de versionamento que
+    // já existia em mergeSites: só ignora se a versão que já temos é igual ou
+    // mais nova que a que chegou.
     private fun mergeFiles(arr: JSONArray) {
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
             val fileId = o.getString("fileId")
-            if (files.containsKey(fileId)) continue
-            
+            val incomingUpdatedAt = o.optLong("updatedAt", 0) // dado antigo (pré-fix) sem o campo: trata como o mais velho possível
+            val existing = files[fileId]
+            if (existing != null && existing.updatedAt >= incomingUpdatedAt) {
+                emit("FILE ignorado (versão não é mais nova): fileId=$fileId existente.updatedAt=${existing.updatedAt} recebido.updatedAt=$incomingUpdatedAt")
+                continue
+            }
+
             val blocks = mutableListOf<BlockMeta>()
             val bArr = o.getJSONArray("blocks")
             
@@ -409,8 +443,11 @@ class GossipRegistry(
             
             files[fileId] = FileMeta(
                 fileId, o.getString("fileName"), o.getInt("k"), o.getInt("m"), o.getInt("n"),
-                o.getInt("blockSize"), o.getInt("originalLength"), blocks
+                o.getInt("blockSize"), o.getInt("originalLength"), blocks,
+                updatedAt = incomingUpdatedAt
             )
+            emit("FILE aceito: fileId=$fileId updatedAt=$incomingUpdatedAt placements=" +
+                blocks.joinToString(" | ") { b -> "bloco${b.blockIndex}:[" + b.placements.joinToString(",") { "${it.shardIndex}->${it.nodeId}" } + "]" })
             scheduleSave()
         }
     }
@@ -435,6 +472,7 @@ class GossipRegistry(
                         migrateShard(file, block, shardIndex, target)
                         block.placements.removeAll { it.shardIndex == shardIndex }
                         block.placements.add(Placement(shardIndex, target.nodeId))
+                        file.updatedAt = System.currentTimeMillis() // senão essa correção nunca vence a versão velha cacheada em outros peers via mergeFiles
                         bumpScore(target.nodeId, +5)
                         scheduleSave() // placement mudou — persistir, senão volta pro nó antigo (morto) depois de um restart
                     } catch (e: Exception) {
