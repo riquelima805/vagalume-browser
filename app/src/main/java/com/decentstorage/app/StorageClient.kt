@@ -107,13 +107,31 @@ class StorageClient(private val registry: GossipRegistry) {
     // Extraído pra ser reaproveitado depois pelo range/streaming
     private fun downloadBlock(file: GossipRegistry.FileMeta, block: GossipRegistry.BlockMeta, fileKey: ByteArray): ByteArray {
         val fetched = mutableListOf<AvailableShard>()
+        val aliveNodeIds = registry.knownPeers().filter { it.alive }.map { it.nodeId }
+        registry.logDebug("DOWNLOAD fileId=${file.fileId} bloco=${block.blockIndex} k=${file.k} placements=" +
+            block.placements.joinToString(",") { "${it.shardIndex}->${it.nodeId}" } +
+            " peersVivos=$aliveNodeIds")
         for (p in block.placements) {
             if (fetched.size >= file.k) break
-            val peer = registry.knownPeers().find { it.nodeId == p.nodeId && it.alive } ?: continue
+            val peer = registry.knownPeers().find { it.nodeId == p.nodeId && it.alive }
+            if (peer == null) {
+                registry.logDebug("DOWNLOAD fileId=${file.fileId} shard${p.shardIndex}: peer '${p.nodeId}' NÃO está na lista de peers vivos — pulado sem tentar rede")
+                continue
+            }
             val data = try {
                 peer.transport.getShard(ShardKeys.of(file.fileId, block.blockIndex, p.shardIndex))
-            } catch (e: Exception) { null }
-            if (data != null) fetched.add(AvailableShard(p.shardIndex, data))
+            } catch (e: Exception) {
+                registry.logDebug("DOWNLOAD fileId=${file.fileId} shard${p.shardIndex}: exceção falando com '${p.nodeId}': ${e.message}")
+                null
+            }
+            if (data != null) {
+                fetched.add(AvailableShard(p.shardIndex, data))
+            } else {
+                registry.logDebug("DOWNLOAD fileId=${file.fileId} shard${p.shardIndex}: peer '${p.nodeId}' respondeu vazio/null")
+            }
+        }
+        if (fetched.size < file.k) {
+            registry.logDebug("DOWNLOAD fileId=${file.fileId} bloco=${block.blockIndex} FALHOU: só ${fetched.size} de ${file.k} shards")
         }
         require(fetched.size >= file.k) {
             "bloco ${block.blockIndex}: só consegui ${fetched.size} de ${file.k} shards necessários"
