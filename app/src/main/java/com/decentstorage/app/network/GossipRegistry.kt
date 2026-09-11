@@ -271,7 +271,8 @@ class GossipRegistry(
                 .put("peers", serializePeers())
                 .put("files", serializeFiles())
                 .put("sites", serializeSites())
-            val response = peer.transport.gossip(payload) ?: run {
+            val response = peer.transport.gossip(payload)
+            if (response == null) {
                 android.util.Log.d("VagalunGossip", "gossip com ${peer.nodeId} retornou null (transporte falhou/timeout)")
                 continue
             }
