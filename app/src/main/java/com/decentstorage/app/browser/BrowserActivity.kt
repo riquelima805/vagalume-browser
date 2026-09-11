@@ -185,8 +185,10 @@ class BrowserActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         val goButton = Button(this).apply { text = "Ir" }
+        val debugButton = Button(this).apply { text = "🔍" }
         addressBar.addView(domainField)
         addressBar.addView(goButton)
+        addressBar.addView(debugButton)
 
         statusText = TextView(this).apply { text = "conectando..."; setPadding(16, 0, 16, 8) }
 
@@ -213,6 +215,34 @@ class BrowserActivity : ComponentActivity() {
             val domain = domainField.text.toString().trim()
             if (domain.isNotEmpty()) navigateTo(domain)
         }
+
+        debugButton.setOnClickListener { showDebugInfo() }
+    }
+
+    // Painel de diagnóstico: mostra exatamente o que o registry sabe agora —
+    // quem são os peers (e se cada um tem transporte WebRTC ativo ou só
+    // relay/nenhum) e quais domínios já foram aprendidos via gossip. Sem
+    // isso, "não achei o site" é uma caixa preta — com isso dá pra saber
+    // na hora se é falta de peer, peer sem WebRTC de verdade, ou o domínio
+    // realmente nunca chegou.
+    private fun showDebugInfo() {
+        val peersInfo = registry.knownPeers().joinToString("\n") { p ->
+            val transporte = when {
+                p.webrtcTransport != null -> "webrtc ✅"
+                else -> "sem transporte ❌ (só apareceu via gossip de outro peer, nunca conectou direto)"
+            }
+            "• ${p.nodeId} — alive=${p.alive} — $transporte"
+        }.ifEmpty { "(nenhum peer conhecido)" }
+
+        val sitesInfo = registry.listSites().joinToString("\n") { "• $it" }.ifEmpty { "(nenhum site conhecido ainda)" }
+
+        val msg = "PEERS (${registry.knownPeers().size}):\n$peersInfo\n\nSITES CONHECIDOS (${registry.listSites().size}):\n$sitesInfo"
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Debug — estado do gossip")
+            .setMessage(msg)
+            .setPositiveButton("Fechar", null)
+            .show()
     }
 
     private fun navigateTo(domain: String) {
