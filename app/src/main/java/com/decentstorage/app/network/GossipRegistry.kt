@@ -202,7 +202,7 @@ class GossipRegistry(
         return try {
             val message = canonicalManifest(domain, routes).toByteArray(Charsets.UTF_8)
             val sig = Base64.getDecoder().decode(signatureB64)
-          val pubkeyBytes = Base58.decode(ownerPubkeyB58)
+            val pubkeyBytes = Base58.decode(ownerPubkeyB58)
             val spec = EdDSANamedCurveTable.getByName(EdDSANamedCurveTable.ED_25519)
             val pub = EdDSAPublicKey(EdDSAPublicKeySpec(pubkeyBytes, spec))
             val engine = EdDSAEngine()
@@ -263,24 +263,38 @@ class GossipRegistry(
         }
     }
 
+    // FIX: cada peer da amostra é isolado em try/catch. Antes, se UM peer
+    // devolvesse um "files"/"sites" em formato levemente diferente (versão
+    // antiga do app-node, campo faltando) e mergeFiles/mergeSites explodisse,
+    // o for inteiro morria ali — os outros peers da rodada nunca eram
+    // processados. Era por isso que "às vezes o site chega e o arquivo não":
+    // dependia de qual peer vinha primeiro no shuffled().
     private fun gossipRound() {
         val sample = peers.values.filter { it.alive }.shuffled().take(3)
         for (peer in sample) {
-            val payload = JSONObject()
-                .put("peers", serializePeers())
-                .put("files", serializeFiles())
-                .put("sites", serializeSites())
-            val response = peer.transport.gossip(payload) ?: continue
-            mergePeers(response.optJSONArray("peers") ?: JSONArray())
-            mergeFiles(response.optJSONArray("files") ?: JSONArray())
-            mergeSites(response.optJSONArray("sites") ?: JSONArray())
+            try {
+                val payload = JSONObject()
+                    .put("peers", serializePeers())
+                    .put("files", serializeFiles())
+                    .put("sites", serializeSites())
+                val response = peer.transport.gossip(payload) ?: continue
+                mergePeers(response.optJSONArray("peers") ?: JSONArray())
+                mergeFiles(response.optJSONArray("files") ?: JSONArray())
+                mergeSites(response.optJSONArray("sites") ?: JSONArray())
+            } catch (e: Exception) {
+                // um peer ruim não pode travar a rodada inteira
+                e.printStackTrace()
+            }
         }
     }
 
+    // FIX: mesmo raciocínio do lado de quem RECEBE gossip — um campo malformado
+    // em "files" não pode impedir "peers"/"sites" de serem processados, nem
+    // impedir a resposta de ser montada no final.
     fun handleIncomingGossip(payload: JSONObject): JSONObject {
-        mergePeers(payload.optJSONArray("peers") ?: JSONArray())
-        mergeFiles(payload.optJSONArray("files") ?: JSONArray())
-        mergeSites(payload.optJSONArray("sites") ?: JSONArray())
+        try { mergePeers(payload.optJSONArray("peers") ?: JSONArray()) } catch (e: Exception) { e.printStackTrace() }
+        try { mergeFiles(payload.optJSONArray("files") ?: JSONArray()) } catch (e: Exception) { e.printStackTrace() }
+        try { mergeSites(payload.optJSONArray("sites") ?: JSONArray()) } catch (e: Exception) { e.printStackTrace() }
         return JSONObject().put("peers", serializePeers()).put("files", serializeFiles()).put("sites", serializeSites())
     }
 
