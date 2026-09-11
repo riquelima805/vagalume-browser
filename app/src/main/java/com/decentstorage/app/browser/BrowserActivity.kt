@@ -1,5 +1,8 @@
 package com.decentstorage.app.browser
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.graphics.Typeface
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
@@ -10,7 +13,9 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import com.decentstorage.app.StorageClient
 import com.decentstorage.app.network.GossipRegistry
@@ -46,6 +51,8 @@ class BrowserActivity : ComponentActivity() {
     private lateinit var storageClient: StorageClient
     private lateinit var webView: WebView
     private lateinit var statusText: TextView
+    private lateinit var debugPanel: LinearLayout
+    private lateinit var debugText: TextView
     private var currentDomain: String? = null
     private val prefs by lazy { getSharedPreferences("vagalun_browser", MODE_PRIVATE) }
     private val relayFallbackExecutor = Executors.newSingleThreadScheduledExecutor()
@@ -70,6 +77,7 @@ class BrowserActivity : ComponentActivity() {
 
         val reg = GossipRegistry(nodeId, "127.0.0.1", 0, 0L, dataDir = filesDir)
         registry = reg
+        reg.onEvent = { DebugLog.add(it) }
         reg.start()
         storageClient = StorageClient(reg)
 
@@ -107,6 +115,7 @@ class BrowserActivity : ComponentActivity() {
             onSignal = { _, _ -> },
             onStateChange = { connected ->
                 Log.d(TAG, "onStateChange connected=$connected peers=${reg.knownPeers().size}")
+                DebugLog.add("SIGNALING onStateChange connected=$connected peers=${reg.knownPeers().size}")
                 runOnUiThread { statusText.text = if (connected) "conectado à rede (${reg.knownPeers().size} peer(s))" else "desconectado do signaling" }
             },
             walletPubkeyBase58 = identity.pubkeyBase58,
@@ -114,6 +123,7 @@ class BrowserActivity : ComponentActivity() {
         )
         sc.onError = { reason, detail ->
             Log.e(TAG, "signaling onError reason=$reason detail=$detail")
+            DebugLog.add("SIGNALING onError reason=$reason detail=$detail")
             runOnUiThread {
                 statusText.text = "erro do signaling: $reason" + (detail?.let { " — $it" } ?: "")
             }
@@ -124,8 +134,16 @@ class BrowserActivity : ComponentActivity() {
             signalingClient = sc,
             selfNodeId = nodeId,
             requestHandler = reqHandler,
-            onTransportReady = { peerId, transport -> Log.d(TAG, "WebRTC pronto com $peerId"); reg.attachWanTransport(peerId, transport) },
-            onTransportClosed = { peerId -> Log.d(TAG, "WebRTC fechado com $peerId"); reg.detachWanTransport(peerId) },
+            onTransportReady = { peerId, transport ->
+                Log.d(TAG, "WebRTC pronto com $peerId")
+                DebugLog.add("WEBRTC pronto com $peerId")
+                reg.attachWanTransport(peerId, transport)
+            },
+            onTransportClosed = { peerId ->
+                Log.d(TAG, "WebRTC fechado com $peerId")
+                DebugLog.add("WEBRTC fechado com $peerId")
+                reg.detachWanTransport(peerId)
+            },
             iceServers = WebRtcManager.defaultIceServers()
         )
         sc.onSignal = { from, payload -> mgr.handleSignal(from, payload) }
@@ -142,6 +160,7 @@ class BrowserActivity : ComponentActivity() {
         // nenhum site aparecia nunca, mesmo com o signaling funcionando.
         sc.onPeerList = { peerIds ->
             Log.d(TAG, "onPeerList: $peerIds")
+            DebugLog.add("SIGNALING onPeerList: $peerIds")
             peerIds.filter { it != nodeId }.forEach { peerId ->
                 mgr.connectToPeer(peerId)
                 scheduleRelayFallback(peerId, reg, sc)
@@ -149,14 +168,21 @@ class BrowserActivity : ComponentActivity() {
         }
         sc.onPeerJoined = { peerId ->
             Log.d(TAG, "onPeerJoined: $peerId")
+            DebugLog.add("SIGNALING onPeerJoined: $peerId")
             if (peerId != nodeId) {
                 mgr.connectToPeer(peerId)
                 scheduleRelayFallback(peerId, reg, sc)
             }
         }
-        sc.onPeerLeft = { peerId -> Log.d(TAG, "onPeerLeft: $peerId"); mgr.disconnect(peerId); reg.detachWanTransport(peerId) }
+        sc.onPeerLeft = { peerId ->
+            Log.d(TAG, "onPeerLeft: $peerId")
+            DebugLog.add("SIGNALING onPeerLeft: $peerId")
+            mgr.disconnect(peerId)
+            reg.detachWanTransport(peerId)
+        }
 
         sc.onRelayRequest = { from, requestId, header, payload ->
+            DebugLog.add("RELAY <- pedido de $from: header=$header")
             val (respHeader, respPayload) = try {
                 reqHandler.handle(header, payload)
             } catch (e: Exception) {
@@ -193,10 +219,61 @@ class BrowserActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         val goButton = Button(this).apply { text = "Ir" }
+        val debugButton = Button(this).apply { text = "Debug" }
         addressBar.addView(domainField)
         addressBar.addView(goButton)
+        addressBar.addView(debugButton)
 
         statusText = TextView(this).apply { text = "conectando..."; setPadding(16, 0, 16, 8) }
+
+        // Painel de debug: log bruto embutido no próprio app — tudo que o
+        // GossipRegistry manda/recebe (gossip cru), eventos de signaling/WebRTC,
+        // e cada tentativa de download de shard (peer achado ou não, sucesso/
+        // falha). Nada disso passa por logcat: dá pra ver e copiar direto daqui,
+        // sem precisar de adb nem esperar timeout de nada.
+        debugPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = android.view.View.GONE
+            setPadding(8, 8, 8, 8)
+        }
+        val debugActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val copyButton = Button(this).apply { text = "Copiar tudo" }
+        val clearButton = Button(this).apply { text = "Limpar" }
+        val refreshButton = Button(this).apply { text = "Atualizar" }
+        debugActions.addView(copyButton)
+        debugActions.addView(clearButton)
+        debugActions.addView(refreshButton)
+
+        debugText = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            textSize = 11f
+            setPadding(8, 8, 8, 8)
+            setTextIsSelectable(true)
+        }
+        val debugScroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 600)
+            addView(debugText)
+        }
+        debugPanel.addView(debugActions)
+        debugPanel.addView(debugScroll)
+
+        fun refreshDebugText() {
+            val content = DebugLog.getAll()
+            debugText.text = if (content.isEmpty()) "(sem eventos registrados ainda)" else content
+        }
+
+        debugButton.setOnClickListener {
+            val showing = debugPanel.visibility == android.view.View.VISIBLE
+            debugPanel.visibility = if (showing) android.view.View.GONE else android.view.View.VISIBLE
+            if (!showing) refreshDebugText()
+        }
+        refreshButton.setOnClickListener { refreshDebugText() }
+        clearButton.setOnClickListener { DebugLog.clear(); refreshDebugText() }
+        copyButton.setOnClickListener {
+            val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("vagalun-debug-log", DebugLog.getAll()))
+            Toast.makeText(this, "Log copiado (${DebugLog.getAll().length} chars)", Toast.LENGTH_SHORT).show()
+        }
 
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
@@ -214,6 +291,7 @@ class BrowserActivity : ComponentActivity() {
 
         root.addView(addressBar)
         root.addView(statusText)
+        root.addView(debugPanel)
         root.addView(webView)
         setContentView(root)
 
@@ -242,13 +320,17 @@ class BrowserActivity : ComponentActivity() {
     private fun resolveAndFetch(domain: String, path: String): Pair<ByteArray, String>? {
         val known = registry.listSites()
         Log.d(TAG, "resolveAndFetch domain=$domain path=$path — sites conhecidos agora (${known.size}): $known")
+        DebugLog.add("RESOLVE domain=$domain path=$path — sites conhecidos (${known.size}): $known")
         val site = registry.getSite(domain) ?: run {
             Log.d(TAG, "getSite($domain) retornou null — não está no índice local ainda")
+            DebugLog.add("RESOLVE getSite($domain) = null — ainda não chegou via gossip")
             return null
         }
         Log.d(TAG, "site encontrado: $domain com ${site.routes.size} rota(s)")
+        DebugLog.add("RESOLVE site encontrado: $domain rotas=${site.routes.map { "${it.path}->${it.fileId}" }}")
         val route = site.routes.find { it.path == path } ?: site.routes.find { it.path == "/" } ?: run {
             Log.d(TAG, "nenhuma rota bate com path=$path nem com '/' — rotas: ${site.routes.map { it.path }}")
+            DebugLog.add("RESOLVE nenhuma rota bate com path=$path")
             return null
         }
         return try {
@@ -256,6 +338,7 @@ class BrowserActivity : ComponentActivity() {
             storageClient.downloadFileWithKey(route.fileId, fileKey) to route.contentType
         } catch (e: Exception) {
             Log.e(TAG, "falha ao baixar fileId=${route.fileId} via P2P", e)
+            DebugLog.add("RESOLVE falha ao baixar fileId=${route.fileId}: ${e.message}")
             null
         }
     }
