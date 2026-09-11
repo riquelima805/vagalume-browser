@@ -199,9 +199,9 @@ class BrowserActivity : ComponentActivity() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val domain = currentDomain ?: return super.shouldInterceptRequest(view, request)
                     val path = request.url.path?.takeIf { it.isNotEmpty() } ?: "/"
-                    return resolveAndFetch(domain, path)?.let { (bytes, contentType) ->
-                        WebResourceResponse(contentType, "utf-8", ByteArrayInputStream(bytes))
-                    }
+                    val result = resolveAndFetch(domain, path)
+                    if (result !is FetchResult.Success) return null
+                    return WebResourceResponse(result.contentType, "utf-8", ByteArrayInputStream(result.bytes))
                 }
             }
         }
@@ -247,28 +247,50 @@ class BrowserActivity : ComponentActivity() {
 
     private fun navigateTo(domain: String) {
         currentDomain = domain
-        val (bytes, contentType) = resolveAndFetch(domain, "/") ?: run {
-            statusText.text = "não achei '$domain' no índice ainda (${registry.knownPeers().size} peer(s) conectados — " +
-                "gossip pode levar alguns segundos, ou o site nunca foi anunciado)"
+        val result = resolveAndFetch(domain, "/")
+        if (result is FetchResult.Failure) {
+            statusText.text = result.reason
             webView.loadData("", "text/plain", "utf-8")
             return
         }
+        result as FetchResult.Success
         statusText.text = "servido 100% via P2P — nenhuma requisição HTTP/DNS normal foi feita"
-        if (contentType.startsWith("text/html")) {
-            webView.loadDataWithBaseURL("https://$domain/", String(bytes, Charsets.UTF_8), contentType, "utf-8", null)
+        if (result.contentType.startsWith("text/html")) {
+            webView.loadDataWithBaseURL("https://$domain/", String(result.bytes, Charsets.UTF_8), result.contentType, "utf-8", null)
         } else {
-            webView.loadData(Base64.getEncoder().encodeToString(bytes), contentType, "base64")
+            webView.loadData(Base64.getEncoder().encodeToString(result.bytes), result.contentType, "base64")
         }
     }
 
-    private fun resolveAndFetch(domain: String, path: String): Pair<ByteArray, String>? {
-        val site = registry.getSite(domain) ?: return null
-        val route = site.routes.find { it.path == path } ?: site.routes.find { it.path == "/" } ?: return null
+    // Antes as 3 causas de falha (site não existe no índice / rota não existe
+    // no manifesto / download do shard falhou) viravam a MESMA mensagem
+    // genérica "não achei" — impossível saber qual das três era sem debugar
+    // o app. Agora cada uma fala exatamente o que aconteceu.
+    private sealed class FetchResult {
+        data class Success(val bytes: ByteArray, val contentType: String) : FetchResult()
+        data class Failure(val reason: String) : FetchResult()
+    }
+
+    private fun resolveAndFetch(domain: String, path: String): FetchResult {
+        val site = registry.getSite(domain)
+            ?: return FetchResult.Failure(
+                "não achei '$domain' no índice (${registry.knownPeers().size} peer(s) conectados — " +
+                    "gossip pode levar alguns segundos, ou o site nunca foi anunciado/o domínio está diferente do publicado)"
+            )
+
+        val route = site.routes.find { it.path == path } ?: site.routes.find { it.path == "/" }
+            ?: return FetchResult.Failure("achei o site '$domain', mas o manifesto não tem nenhuma rota pra '$path' nem '/'")
+
         return try {
             val fileKey = Base64.getDecoder().decode(route.fileKeyB64)
-            storageClient.downloadFileWithKey(route.fileId, fileKey) to route.contentType
+            val bytes = storageClient.downloadFileWithKey(route.fileId, fileKey)
+            FetchResult.Success(bytes, route.contentType)
         } catch (e: Exception) {
-            null
+            FetchResult.Failure(
+                "achei o manifesto de '$domain', mas falhou baixar o arquivo (fileId=${route.fileId.take(8)}...): " +
+                    "${e.javaClass.simpleName}: ${e.message} — provavelmente nenhum peer conectado agora tem os shards " +
+                    "desse arquivo (k mínimo de blocos não disponível)"
+            )
         }
     }
 
