@@ -3,20 +3,25 @@ package com.decentstorage.app.browser
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
+import android.view.View
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageButton
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.core.content.ContextCompat
+import com.decentstorage.app.R
 import com.decentstorage.app.StorageClient
 import com.decentstorage.app.network.GossipRegistry
 import com.decentstorage.app.network.NodeIdentity
@@ -51,6 +56,9 @@ class BrowserActivity : ComponentActivity() {
     private lateinit var storageClient: StorageClient
     private lateinit var webView: WebView
     private lateinit var statusText: TextView
+    private lateinit var statusDot: View
+    private lateinit var statusChip: LinearLayout
+    private lateinit var loadingBar: ProgressBar
     private lateinit var debugPanel: LinearLayout
     private lateinit var debugText: TextView
     private var currentDomain: String? = null
@@ -60,8 +68,24 @@ class BrowserActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.statusBarColor = ContextCompat.getColor(this, R.color.vgl_vermelho_escuro)
         startPeer()
         buildUi()
+    }
+
+    // Estado visual do chip de status: cor do ponto + fundo do chip. Mantido só na
+    // camada de UI — nenhuma lógica de rede depende disso, é puramente cosmético.
+    private enum class StatusState { CONECTANDO, CONECTADO, ERRO }
+
+    private fun setStatus(text: String, state: StatusState = StatusState.CONECTANDO) {
+        statusText.text = text
+        val (dotColor, chipBg) = when (state) {
+            StatusState.CONECTADO -> R.color.vgl_vermelho_primario to R.color.vgl_creme
+            StatusState.CONECTANDO -> R.color.vgl_vermelho_claro to R.color.vgl_creme_escuro
+            StatusState.ERRO -> R.color.vgl_vermelho_escuro to R.color.vgl_vermelho_claríssimo
+        }
+        (statusDot.background as GradientDrawable).setColor(ContextCompat.getColor(this, dotColor))
+        (statusChip.background as GradientDrawable).setColor(ContextCompat.getColor(this, chipBg))
     }
 
     // Sobe só o suficiente pra ser um peer leve: nodeId estável, GossipRegistry sem
@@ -91,7 +115,7 @@ class BrowserActivity : ComponentActivity() {
         thread {
             val signalingUrl = RelayConfig.fetchSignalingUrl()
             if (signalingUrl == null) {
-                runOnUiThread { statusText.text = "signaling indisponível agora — sem peers pra consultar ainda" }
+                runOnUiThread { setStatus("signaling indisponível agora — sem peers pra consultar ainda", StatusState.ERRO) }
                 return@thread
             }
             connectSignaling(signalingUrl, nodeId, reg, reqHandler)
@@ -116,7 +140,10 @@ class BrowserActivity : ComponentActivity() {
             onStateChange = { connected ->
                 Log.d(TAG, "onStateChange connected=$connected peers=${reg.knownPeers().size}")
                 DebugLog.add("SIGNALING onStateChange connected=$connected peers=${reg.knownPeers().size}")
-                runOnUiThread { statusText.text = if (connected) "conectado à rede (${reg.knownPeers().size} peer(s))" else "desconectado do signaling" }
+                runOnUiThread {
+                    if (connected) setStatus("conectado à rede (${reg.knownPeers().size} peer(s))", StatusState.CONECTADO)
+                    else setStatus("desconectado do signaling", StatusState.ERRO)
+                }
             },
             walletPubkeyBase58 = identity.pubkeyBase58,
             signNodeId = identity.sign
@@ -125,7 +152,7 @@ class BrowserActivity : ComponentActivity() {
             Log.e(TAG, "signaling onError reason=$reason detail=$detail")
             DebugLog.add("SIGNALING onError reason=$reason detail=$detail")
             runOnUiThread {
-                statusText.text = "erro do signaling: $reason" + (detail?.let { " — $it" } ?: "")
+                setStatus("erro do signaling: $reason" + (detail?.let { " — $it" } ?: ""), StatusState.ERRO)
             }
         }
 
@@ -206,54 +233,165 @@ class BrowserActivity : ComponentActivity() {
         }, RELAY_FALLBACK_DELAY_SECONDS, TimeUnit.SECONDS)
     }
 
-    private fun buildUi() {
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-        val addressBar = LinearLayout(this).apply {
+    private fun buildUi() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(ContextCompat.getColor(this@BrowserActivity, R.color.vgl_creme))
+        }
+
+        // ---------- Toolbar (barra de endereço estilo navegador) ----------
+        val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(16, 16, 16, 8)
+            setPadding(dp(12), dp(14), dp(12), dp(10))
+            background = ContextCompat.getDrawable(this@BrowserActivity, R.drawable.bg_toolbar)
+            elevation = dp(4).toFloat()
+        }
+
+        val refreshButton = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_refresh)
+            background = ContextCompat.getDrawable(this@BrowserActivity, R.drawable.bg_button_ghost)
+            layoutParams = LinearLayout.LayoutParams(dp(38), dp(38)).apply { marginEnd = dp(8) }
+            setPadding(dp(9), dp(9), dp(9), dp(9))
+            contentDescription = "Recarregar"
+        }
+
+        // Campo de endereço "pill": cadeado à esquerda (sinaliza que é P2P, não
+        // HTTP/DNS normal), EditText transparente, botão "Ir" circular vermelho.
+        val addressField = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = ContextCompat.getDrawable(this@BrowserActivity, R.drawable.bg_address_field)
+            layoutParams = LinearLayout.LayoutParams(0, dp(46), 1f).apply { marginEnd = dp(8) }
+            setPadding(dp(14), 0, dp(6), 0)
+        }
+        val lockIcon = android.widget.ImageView(this).apply {
+            setImageResource(R.drawable.ic_lock)
+            layoutParams = LinearLayout.LayoutParams(dp(16), dp(16))
         }
         val domainField = EditText(this).apply {
             hint = "dominio.vgl"
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setHintTextColor(ContextCompat.getColor(this@BrowserActivity, R.color.vgl_texto_secundario))
+            setTextColor(ContextCompat.getColor(this@BrowserActivity, R.color.vgl_texto_principal))
+            background = null
+            setPadding(dp(10), 0, dp(4), 0)
+            textSize = 15f
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_GO
+            setSingleLine(true)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
         }
-        val goButton = Button(this).apply { text = "Ir" }
-        val debugButton = Button(this).apply { text = "Debug" }
-        addressBar.addView(domainField)
-        addressBar.addView(goButton)
-        addressBar.addView(debugButton)
+        addressField.addView(lockIcon)
+        addressField.addView(domainField)
 
-        statusText = TextView(this).apply { text = "conectando..."; setPadding(16, 0, 16, 8) }
+        val goButton = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_go)
+            background = ContextCompat.getDrawable(this@BrowserActivity, R.drawable.bg_button_primary)
+            layoutParams = LinearLayout.LayoutParams(dp(42), dp(42)).apply { marginEnd = dp(6) }
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            contentDescription = "Ir"
+        }
 
-        // Painel de debug: log bruto embutido no próprio app — tudo que o
-        // GossipRegistry manda/recebe (gossip cru), eventos de signaling/WebRTC,
-        // e cada tentativa de download de shard (peer achado ou não, sucesso/
-        // falha). Nada disso passa por logcat: dá pra ver e copiar direto daqui,
-        // sem precisar de adb nem esperar timeout de nada.
+        val debugButton = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_bug)
+            background = ContextCompat.getDrawable(this@BrowserActivity, R.drawable.bg_button_ghost)
+            layoutParams = LinearLayout.LayoutParams(dp(38), dp(38))
+            setPadding(dp(9), dp(9), dp(9), dp(9))
+            contentDescription = "Debug"
+        }
+
+        toolbar.addView(refreshButton)
+        toolbar.addView(addressField)
+        toolbar.addView(goButton)
+        toolbar.addView(debugButton)
+
+        // Barra de progresso fininha estilo navegador, some quando não está carregando
+        loadingBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(3))
+            isIndeterminate = true
+            progressTintList = android.content.res.ColorStateList.valueOf(
+                ContextCompat.getColor(this@BrowserActivity, R.color.vgl_vermelho_primario)
+            )
+            visibility = View.GONE
+        }
+
+        // ---------- Chip de status (ponto colorido + texto) ----------
+        statusChip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = ContextCompat.getDrawable(this@BrowserActivity, R.drawable.bg_status_chip)?.mutate()
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(dp(14), dp(8), dp(14), dp(8)) }
+            setPadding(dp(10), dp(6), dp(12), dp(6))
+        }
+        statusDot = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginEnd = dp(8) }
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(ContextCompat.getColor(this@BrowserActivity, R.color.vgl_vermelho_claro))
+            }
+        }
+        statusText = TextView(this).apply {
+            text = "conectando..."
+            textSize = 12.5f
+            setTextColor(ContextCompat.getColor(this@BrowserActivity, R.color.vgl_texto_principal))
+        }
+        statusChip.addView(statusDot)
+        statusChip.addView(statusText)
+
+        // ---------- Painel de debug (log bruto embutido no próprio app) ----------
+        // Tudo que o GossipRegistry manda/recebe (gossip cru), eventos de
+        // signaling/WebRTC, e cada tentativa de download de shard (peer achado
+        // ou não, sucesso/falha). Nada disso passa por logcat: dá pra ver e
+        // copiar direto daqui, sem precisar de adb nem esperar timeout de nada.
         debugPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            visibility = android.view.View.GONE
-            setPadding(8, 8, 8, 8)
+            visibility = View.GONE
+            background = ContextCompat.getDrawable(this@BrowserActivity, R.drawable.bg_debug_panel)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
         }
-        val debugActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val copyButton = Button(this).apply { text = "Copiar tudo" }
-        val clearButton = Button(this).apply { text = "Limpar" }
-        val refreshButton = Button(this).apply { text = "Atualizar" }
+        val debugTitle = TextView(this).apply {
+            text = "Debug — log P2P"
+            setTextColor(ContextCompat.getColor(this@BrowserActivity, R.color.vgl_debug_texto))
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(4), 0, dp(4), dp(8))
+        }
+        val debugActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 0, 0, dp(8))
+        }
+        fun debugActionButton(label: String) = TextView(this).apply {
+            text = label
+            setTextColor(ContextCompat.getColor(this@BrowserActivity, R.color.vgl_debug_texto))
+            textSize = 12f
+            background = ContextCompat.getDrawable(this@BrowserActivity, R.drawable.bg_debug_button)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(8) }
+        }
+        val copyButton = debugActionButton("Copiar tudo")
+        val clearButton = debugActionButton("Limpar")
+        val refreshDebugButton = debugActionButton("Atualizar")
         debugActions.addView(copyButton)
         debugActions.addView(clearButton)
-        debugActions.addView(refreshButton)
+        debugActions.addView(refreshDebugButton)
 
         debugText = TextView(this).apply {
             typeface = Typeface.MONOSPACE
             textSize = 11f
-            setPadding(8, 8, 8, 8)
+            setTextColor(ContextCompat.getColor(this@BrowserActivity, R.color.vgl_debug_texto))
+            setPadding(dp(6), dp(6), dp(6), dp(6))
             setTextIsSelectable(true)
         }
         val debugScroll = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 600)
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(280))
             addView(debugText)
         }
+        debugPanel.addView(debugTitle)
         debugPanel.addView(debugActions)
         debugPanel.addView(debugScroll)
 
@@ -263,11 +401,11 @@ class BrowserActivity : ComponentActivity() {
         }
 
         debugButton.setOnClickListener {
-            val showing = debugPanel.visibility == android.view.View.VISIBLE
-            debugPanel.visibility = if (showing) android.view.View.GONE else android.view.View.VISIBLE
+            val showing = debugPanel.visibility == View.VISIBLE
+            debugPanel.visibility = if (showing) View.GONE else View.VISIBLE
             if (!showing) refreshDebugText()
         }
-        refreshButton.setOnClickListener { refreshDebugText() }
+        refreshDebugButton.setOnClickListener { refreshDebugText() }
         clearButton.setOnClickListener { DebugLog.clear(); refreshDebugText() }
         copyButton.setOnClickListener {
             val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
@@ -275,8 +413,10 @@ class BrowserActivity : ComponentActivity() {
             Toast.makeText(this, "Log copiado (${DebugLog.getAll().length} chars)", Toast.LENGTH_SHORT).show()
         }
 
+        // ---------- WebView ----------
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+            setBackgroundColor(ContextCompat.getColor(this@BrowserActivity, R.color.vgl_branco))
             settings.javaScriptEnabled = true
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
@@ -289,27 +429,52 @@ class BrowserActivity : ComponentActivity() {
             }
         }
 
-        root.addView(addressBar)
-        root.addView(statusText)
+        root.addView(toolbar)
+        root.addView(loadingBar)
+        root.addView(statusChip)
         root.addView(debugPanel)
         root.addView(webView)
         setContentView(root)
+
+        setStatus("conectando...", StatusState.CONECTANDO)
 
         goButton.setOnClickListener {
             val domain = domainField.text.toString().trim()
             if (domain.isNotEmpty()) navigateTo(domain)
         }
+        refreshButton.setOnClickListener {
+            currentDomain?.let { navigateTo(it) }
+        }
+        domainField.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_GO) {
+                val domain = domainField.text.toString().trim()
+                if (domain.isNotEmpty()) navigateTo(domain)
+                true
+            } else false
+        }
+        domainField.setOnFocusChangeListener { _, hasFocus ->
+            addressField.background = ContextCompat.getDrawable(
+                this,
+                if (hasFocus) R.drawable.bg_address_field_focused else R.drawable.bg_address_field
+            )
+        }
     }
 
     private fun navigateTo(domain: String) {
         currentDomain = domain
+        loadingBar.visibility = View.VISIBLE
         val (bytes, contentType) = resolveAndFetch(domain, "/") ?: run {
-            statusText.text = "não achei '$domain' no índice ainda (${registry.knownPeers().size} peer(s) conectados — " +
-                "gossip pode levar alguns segundos, ou o site nunca foi anunciado)"
+            loadingBar.visibility = View.GONE
+            setStatus(
+                "não achei '$domain' no índice ainda (${registry.knownPeers().size} peer(s) conectados — " +
+                    "gossip pode levar alguns segundos, ou o site nunca foi anunciado)",
+                StatusState.ERRO
+            )
             webView.loadData("", "text/plain", "utf-8")
             return
         }
-        statusText.text = "servido 100% via P2P — nenhuma requisição HTTP/DNS normal foi feita"
+        loadingBar.visibility = View.GONE
+        setStatus("servido 100% via P2P — nenhuma requisição HTTP/DNS normal foi feita", StatusState.CONECTADO)
         if (contentType.startsWith("text/html")) {
             webView.loadDataWithBaseURL("https://$domain/", String(bytes, Charsets.UTF_8), contentType, "utf-8", null)
         } else {
