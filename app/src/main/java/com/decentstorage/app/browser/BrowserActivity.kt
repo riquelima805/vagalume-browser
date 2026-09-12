@@ -68,6 +68,8 @@ class BrowserActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        actionBar?.hide()
         window.statusBarColor = ContextCompat.getColor(this, R.color.vgl_vermelho_escuro)
         startPeer()
         buildUi()
@@ -465,6 +467,7 @@ class BrowserActivity : ComponentActivity() {
         loadingBar.visibility = View.VISIBLE
         val (bytes, contentType) = resolveAndFetch(domain, "/") ?: run {
             loadingBar.visibility = View.GONE
+            statusChip.visibility = View.VISIBLE
             setStatus(
                 "não achei '$domain' no índice ainda (${registry.knownPeers().size} peer(s) conectados — " +
                     "gossip pode levar alguns segundos, ou o site nunca foi anunciado)",
@@ -474,7 +477,7 @@ class BrowserActivity : ComponentActivity() {
             return
         }
         loadingBar.visibility = View.GONE
-        setStatus("servido 100% via P2P — nenhuma requisição HTTP/DNS normal foi feita", StatusState.CONECTADO)
+        statusChip.visibility = View.GONE
         if (contentType.startsWith("text/html")) {
             webView.loadDataWithBaseURL("https://$domain/", String(bytes, Charsets.UTF_8), contentType, "utf-8", null)
         } else {
