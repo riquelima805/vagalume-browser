@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit
 
 /**
  * `dataDir`: pasta (normalmente `filesDir` da Activity/App) onde o registry
- * persiste `files` e `peers` conhecidos (`gossip-registry.json`). Sem isso,
+ * persiste `files`, `sites` e `peers` conhecidos (`gossip-registry.json`). Sem isso,
  * o mapa inteiro vive só na RAM: se o processo for morto pelo Android (app
  * em background por um tempo, pouca memória, etc.) e reaberto depois, o
  * dono do arquivo "esquece" que ele existe — mesmo os shards continuando
@@ -41,7 +41,7 @@ class GossipRegistry(
         var lastSeen: Long = System.currentTimeMillis(),
         var alive: Boolean = true,
         var freeBytes: Long = 0,
-        
+
         var webrtcTransport: Transport? = null
     ) {
         val transport: Transport
@@ -76,21 +76,30 @@ class GossipRegistry(
         var updatedAt: Long = System.currentTimeMillis()
     )
 
-    // --- Índice de sites (navegador P2P) ---
+    // --- Índice de sites (mesmo mecanismo do vagalume-browser) ---
     // Espelha exatamente o `sites` do gateway (sever/gateway/registry.js): mesmo formato
     // de rota (path, fileId, contentType) e mesma assinatura Ed25519 sobre o mesmo
-    // canonicalManifest(domain, routes). A diferença é que aqui roda dentro do próprio
-    // app, gossipado peer-a-peer junto com `peers`/`files` (mesmo transporte, mesmo
-    // round de 6s) — nenhum nó precisa de HTTP/VPS pra aprender sobre um site.
+    // canonicalManifest(domain, routes). Roda dentro do próprio app, gossipado
+    // peer-a-peer junto com `peers`/`files` (mesmo transporte, mesmo round de 6s) —
+    // nenhum nó precisa de HTTP/VPS pra aprender ou repassar um site.
     // fileKeyB64 viaja por fora da assinatura (mesma decisão do gateway: só é seguro
     // publicar a chave pra conteúdo que já é público por natureza, como um site).
+    //
+    // FIX: essa classe/mapa não existia nesta cópia do GossipRegistry (só a do
+    // navegador tinha). Resultado: handleIncomingGossip()/gossipRound() nunca liam
+    // nem devolviam a chave "sites" do payload — todo node rodando esse app "comia"
+    // o campo e sempre respondia "sites":[], mesmo repassando pra frente o gossip de
+    // um peer que tinha sites conhecidos. Ver GossipRegistry.mergeSites, referenciado
+    // em sever/gateway/registry.js, que era o outro lado que faltava aqui.
     data class SiteRoute(val path: String, val fileId: String, val contentType: String, val fileKeyB64: String)
     data class SiteMeta(
         val domain: String,
         val ownerPubkeyB58: String,
         val routes: List<SiteRoute>,
-        val signatureB64: String,
-        val updatedAt: Long
+        val signatureB64: String,   // v1 (legado) — a única, quando version == 0
+        val updatedAt: Long,
+        val version: Long = 0,      // 0 = manifesto v1; >= 1 = v2 (assinado, estritamente crescente)
+        val signatureV2B64: String = ""
     )
 
     private val sites = ConcurrentHashMap<String, SiteMeta>()
@@ -101,8 +110,7 @@ class GossipRegistry(
 
     private val ALIVE_TIMEOUT_MS = 15_000L
 
-    // Hook opcional pra debug embutido no app (ver DebugLog.kt / BrowserActivity).
-    // Não afeta em nada quem não setar isso (app-node principal não usa).
+    // Hook opcional de debug (mesmo padrão do navegador) — não afeta quem não setar.
     var onEvent: ((String) -> Unit)? = null
     private fun emit(msg: String) { onEvent?.invoke(msg) }
     fun logDebug(msg: String) = emit(msg) // usado por StorageClient.kt (fora desta classe) pra registrar falha/sucesso de download
@@ -146,7 +154,7 @@ class GossipRegistry(
                 val tmp = File(file.parentFile, "${file.name}.tmp")
                 tmp.writeText(out.toString())
                 if (!tmp.renameTo(file)) {
-                    // fallback caso rename atômico falhe (ex.: filesystem diferente)
+                    
                     file.writeText(out.toString())
                     tmp.delete()
                 }
@@ -156,9 +164,7 @@ class GossipRegistry(
         }, 250, TimeUnit.MILLISECONDS)
     }
 
-    // Só nodeId/host/port — o resto (score, alive, freeBytes, transport) é
-    // estado efêmero que faz sentido recalcular do zero a cada boot via
-    // healthCheck()/gossip, não persistir.
+    
     private fun serializePeersForPersistence(): JSONArray {
         val arr = JSONArray()
         for (p in peers.values) {
@@ -178,8 +184,7 @@ class GossipRegistry(
                 PeerInfo(nodeId, host, port)
             }
         }
-        // só persiste quando é peer novo — atualizar lastSeen a cada gossip
-        // (que roda de poucos em poucos segundos) geraria escrita constante.
+       
         if (isNew) scheduleSave()
     }
 
@@ -199,6 +204,7 @@ class GossipRegistry(
     }
 
     fun registerFile(meta: FileMeta) {
+        
         meta.updatedAt = System.currentTimeMillis()
         files[meta.fileId] = meta
         scheduleSave()
@@ -206,19 +212,17 @@ class GossipRegistry(
     fun getFile(fileId: String): FileMeta? = files[fileId]
     fun knownPeers(): List<PeerInfo> = peers.values.toList()
 
-    // Mesma fórmula do gateway.js: assina/verifica "domain\npath|fileId|contentType"
-    // ordenado por path — string canônica, sem espaço pra ambiguidade.
+    
     fun canonicalManifest(domain: String, routes: List<SiteRoute>): String {
         val sorted = routes.sortedBy { it.path }
         val body = sorted.joinToString("\n") { "${it.path}|${it.fileId}|${it.contentType}" }
         return "$domain\n$body"
     }
 
-    private fun verifySiteSignature(domain: String, ownerPubkeyB58: String, routes: List<SiteRoute>, signatureB64: String): Boolean {
+    private fun verifyEd25519(message: ByteArray, signatureB64: String, ownerPubkeyB58: String): Boolean {
         return try {
-            val message = canonicalManifest(domain, routes).toByteArray(Charsets.UTF_8)
             val sig = Base64.getDecoder().decode(signatureB64)
-          val pubkeyBytes = Base58.decode(ownerPubkeyB58)
+            val pubkeyBytes = Base58.decode(ownerPubkeyB58)
             val spec = EdDSANamedCurveTable.getByName(EdDSANamedCurveTable.ED_25519)
             val pub = EdDSAPublicKey(EdDSAPublicKeySpec(pubkeyBytes, spec))
             val engine = EdDSAEngine()
@@ -230,9 +234,56 @@ class GossipRegistry(
         }
     }
 
-    // O navegador NUNCA confia num manifesto que não conseguiu verificar sozinho —
-    // seja publicado localmente, seja aprendido de outro peer via gossip.
+    private fun verifySiteSignature(domain: String, ownerPubkeyB58: String, routes: List<SiteRoute>, signatureB64: String): Boolean {
+        val message = canonicalManifest(domain, routes).toByteArray(Charsets.UTF_8)
+        return verifyEd25519(message, signatureB64, ownerPubkeyB58)
+    }
+
+    // ---- Manifesto v2 (idêntico a sever/chain/siteManifest.js, byte a byte) ----
+    // Corrige 3 furos do v1: ordem (localeCompare no JS x sortedBy aqui divergiam), '|' ambíguo
+    // e fileKey/versão fora da assinatura.
+    private val domainV2Regex = Regex("^[a-z0-9.-]{3,100}$")
+
+    private fun validDomainV2(d: String): Boolean =
+        domainV2Regex.matches(d) && !d.startsWith(".") && !d.startsWith("-") &&
+            !d.endsWith(".") && !d.endsWith("-") && !d.contains("..")
+
+    /** Ordem por bytes UTF-8 sem sinal — a mesma do Buffer.compare do Node. */
+    private fun cmpUtf8(a: String, b: String): Int {
+        val x = a.toByteArray(Charsets.UTF_8)
+        val y = b.toByteArray(Charsets.UTF_8)
+        val n = minOf(x.size, y.size)
+        for (i in 0 until n) {
+            val d = (x[i].toInt() and 0xff) - (y[i].toInt() and 0xff)
+            if (d != 0) return d
+        }
+        return x.size - y.size
+    }
+
+    /** null => manifesto inválido (campo com '|' ou quebra de linha, rota duplicada, domínio/versão ruins). */
+    fun canonicalManifestV2(domain: String, version: Long, routes: List<SiteRoute>): String? {
+        if (!validDomainV2(domain) || version < 1) return null
+        val seen = HashSet<String>()
+        val lines = ArrayList<String>()
+        for (r in routes.sortedWith { a, b -> cmpUtf8(a.path, b.path) }) {
+            for (f in listOf(r.path, r.fileId, r.contentType, r.fileKeyB64)) {
+                if (f.contains('\n') || f.contains('|')) return null
+            }
+            if (!seen.add(r.path)) return null
+            lines.add("${r.path}|${r.fileId}|${r.contentType}|${r.fileKeyB64}")
+        }
+        return (listOf("vagalun-site-v2", domain, version.toString()) + lines).joinToString("\n")
+    }
+
+    private fun verifySiteSignatureV2(domain: String, ownerPubkeyB58: String, version: Long, routes: List<SiteRoute>, signatureV2B64: String): Boolean {
+        val message = canonicalManifestV2(domain, version, routes)?.toByteArray(Charsets.UTF_8) ?: return false
+        return verifyEd25519(message, signatureV2B64, ownerPubkeyB58)
+    }
+
     fun registerSite(domain: String, ownerPubkeyB58: String, routes: List<SiteRoute>, signatureB64: String): Boolean {
+        val prev = sites[domain]
+        // dono pinado: ninguém "re-registra" um domínio com outra chave; e v2 nunca volta pra v1
+        if (prev != null && (prev.ownerPubkeyB58 != ownerPubkeyB58 || prev.version > 0)) return false
         if (!verifySiteSignature(domain, ownerPubkeyB58, routes, signatureB64)) return false
         val candidate = SiteMeta(domain, ownerPubkeyB58, routes, signatureB64, System.currentTimeMillis())
         sites[domain] = candidate
@@ -327,21 +378,39 @@ class GossipRegistry(
                     .put("domain", s.domain).put("ownerPubkeyB58", s.ownerPubkeyB58)
                     .put("routes", routesArr).put("signatureB64", s.signatureB64)
                     .put("updatedAt", s.updatedAt)
+                    .put("version", s.version).put("signatureV2B64", s.signatureV2B64)
             )
         }
         return arr
     }
 
-    // Re-verifica a assinatura de todo manifesto vindo de outro peer antes de aceitar —
-    // gossip é só transporte, confiança continua sendo 100% criptográfica, nunca "confio
-    // porque veio de um peer que eu já conhecia".
+    
     private fun mergeSites(arr: JSONArray) {
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
             val domain = o.getString("domain")
+            val ownerPubkeyB58 = o.getString("ownerPubkeyB58")
             val incomingUpdatedAt = o.optLong("updatedAt", 0)
+            val incomingVersion = o.optLong("version", 0)          // 0/ausente = manifesto v1 (legado)
+            val signatureB64 = o.optString("signatureB64", "")
+            val signatureV2B64 = o.optString("signatureV2B64", "")
             val existing = sites[domain]
-            if (existing != null && existing.updatedAt >= incomingUpdatedAt) continue
+
+            if (existing != null) {
+                // 1) dono pinado (TOFU local; vira "dono segundo a chain" quando o resolver on-chain entrar)
+                if (existing.ownerPubkeyB58 != ownerPubkeyB58) {
+                    emit("SITE recusado ($domain): dono diferente do que já conhecemos")
+                    continue
+                }
+                if (incomingVersion > 0) {
+                    // 2) anti-rollback: v2 só avança
+                    if (existing.version >= incomingVersion) continue
+                } else {
+                    // 3) anti-downgrade: depois de ter v2, v1 nunca mais; entre v1s, vale o updatedAt de sempre
+                    if (existing.version > 0) continue
+                    if (existing.updatedAt >= incomingUpdatedAt) continue
+                }
+            }
 
             val routesArr = o.getJSONArray("routes")
             val routes = mutableListOf<SiteRoute>()
@@ -349,11 +418,14 @@ class GossipRegistry(
                 val r = routesArr.getJSONObject(j)
                 routes.add(SiteRoute(r.getString("path"), r.getString("fileId"), r.getString("contentType"), r.optString("fileKeyB64", "")))
             }
-            val ownerPubkeyB58 = o.getString("ownerPubkeyB58")
-            val signatureB64 = o.getString("signatureB64")
-            if (!verifySiteSignature(domain, ownerPubkeyB58, routes, signatureB64)) continue // manifesto forjado/corrompido: ignora
+            val valid = if (incomingVersion > 0) {
+                signatureV2B64.isNotEmpty() && verifySiteSignatureV2(domain, ownerPubkeyB58, incomingVersion, routes, signatureV2B64)
+            } else {
+                signatureB64.isNotEmpty() && verifySiteSignature(domain, ownerPubkeyB58, routes, signatureB64)
+            }
+            if (!valid) continue // manifesto forjado/corrompido: ignora
 
-            sites[domain] = SiteMeta(domain, ownerPubkeyB58, routes, signatureB64, incomingUpdatedAt)
+            sites[domain] = SiteMeta(domain, ownerPubkeyB58, routes, signatureB64, incomingUpdatedAt, incomingVersion, signatureV2B64)
             scheduleSave()
         }
     }
@@ -381,7 +453,7 @@ class GossipRegistry(
             for (b in f.blocks) {
                 val placementsArr = JSONArray()
                 for (p in b.placements) placementsArr.put(JSONObject().put("shardIndex", p.shardIndex).put("nodeId", p.nodeId))
-                
+
                 blocksArr.put(
                     JSONObject()
                         .put("blockIndex", b.blockIndex)
@@ -404,17 +476,11 @@ class GossipRegistry(
         return arr
     }
 
-    // ANTES: `if (files.containsKey(fileId)) continue` travava o placement pra
-    // sempre na primeira versão aprendida — nem republicar no gateway e rodar o
-    // backfill de novo adiantava, porque esse `continue` matava o merge antes
-    // de sequer olhar o conteúdo novo. Agora, mesma lógica de versionamento que
-    // já existia em mergeSites: só ignora se a versão que já temos é igual ou
-    // mais nova que a que chegou.
     private fun mergeFiles(arr: JSONArray) {
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
             val fileId = o.getString("fileId")
-            val incomingUpdatedAt = o.optLong("updatedAt", 0) // dado antigo (pré-fix) sem o campo: trata como o mais velho possível
+            val incomingUpdatedAt = o.optLong("updatedAt", 0) 
             val existing = files[fileId]
             if (existing != null && existing.updatedAt >= incomingUpdatedAt) {
                 emit("FILE ignorado (versão não é mais nova): fileId=$fileId existente.updatedAt=${existing.updatedAt} recebido.updatedAt=$incomingUpdatedAt")
@@ -423,7 +489,7 @@ class GossipRegistry(
 
             val blocks = mutableListOf<BlockMeta>()
             val bArr = o.getJSONArray("blocks")
-            
+
             for (j in 0 until bArr.length()) {
                 val b = bArr.getJSONObject(j)
                 val placements = mutableListOf<Placement>()
@@ -432,7 +498,7 @@ class GossipRegistry(
                     val p = pArr.getJSONObject(x)
                     placements.add(Placement(p.getInt("shardIndex"), p.getString("nodeId")))
                 }
-                
+
                 blocks.add(
                     BlockMeta(
                         b.getInt("blockIndex"), b.getInt("plainLength"), b.getInt("shardSize"),
@@ -440,7 +506,7 @@ class GossipRegistry(
                     )
                 )
             }
-            
+
             files[fileId] = FileMeta(
                 fileId, o.getString("fileName"), o.getInt("k"), o.getInt("m"), o.getInt("n"),
                 o.getInt("blockSize"), o.getInt("originalLength"), blocks,
@@ -472,9 +538,9 @@ class GossipRegistry(
                         migrateShard(file, block, shardIndex, target)
                         block.placements.removeAll { it.shardIndex == shardIndex }
                         block.placements.add(Placement(shardIndex, target.nodeId))
-                        file.updatedAt = System.currentTimeMillis() // senão essa correção nunca vence a versão velha cacheada em outros peers via mergeFiles
+                        file.updatedAt = System.currentTimeMillis() 
                         bumpScore(target.nodeId, +5)
-                        scheduleSave() // placement mudou — persistir, senão volta pro nó antigo (morto) depois de um restart
+                        scheduleSave() 
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
@@ -490,7 +556,7 @@ class GossipRegistry(
         val fetched = mutableListOf<AvailableShard>()
         for (p in alivePlacements.take(file.k)) {
             val bytes = if (p.nodeId == selfNodeId) {
-                null 
+                null
             } else {
                 val peer = peers[p.nodeId] ?: continue
                 peer.transport.getShard(ShardKeys.of(file.fileId, block.blockIndex, p.shardIndex))
