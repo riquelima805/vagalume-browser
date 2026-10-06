@@ -25,10 +25,11 @@ import com.decentstorage.app.R
 import com.decentstorage.app.StorageClient
 import com.decentstorage.app.network.GossipRegistry
 import com.decentstorage.app.network.NodeIdentity
-import com.decentstorage.app.network.RelayConfig
 import com.decentstorage.app.network.ShardRequestHandler
 import com.decentstorage.app.network.webrtc.WebRtcManager
 import com.decentstorage.app.network.webrtc.RelayTransport
+import com.decentstorage.app.network.webrtc.SignalerList
+import com.decentstorage.app.network.webrtc.SignalerStorage
 import com.decentstorage.app.network.webrtc.SignalingClient
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -114,17 +115,12 @@ class BrowserActivity : ComponentActivity() {
             reg.handleIncomingGossip(payload)
         }
 
-        thread {
-            val signalingUrl = RelayConfig.fetchSignalingUrl()
-            if (signalingUrl == null) {
-                runOnUiThread { setStatus("signaling indisponível agora — sem peers pra consultar ainda", StatusState.ERRO) }
-                return@thread
-            }
-            connectSignaling(signalingUrl, nodeId, reg, reqHandler)
-        }
+        // Signaling federado: seeds embutidos + lista remota (buscada em segundo plano
+        // pelo próprio SignalingClient). Não bloqueia mais esperando uma URL única.
+        thread { connectSignaling(nodeId, reg, reqHandler) }
     }
 
-    private fun connectSignaling(signalingUrl: String, nodeId: String, reg: GossipRegistry, reqHandler: ShardRequestHandler) {
+    private fun connectSignaling(nodeId: String, reg: GossipRegistry, reqHandler: ShardRequestHandler) {
         // Desde o patch anti-hijack de nodeId no signaling, TODO register de
         // peer não-infra precisa provar posse via assinatura Ed25519
         // (pubkey+sig) — sem isso o servidor responde 'register_unauthorized'
@@ -133,10 +129,17 @@ class BrowserActivity : ComponentActivity() {
         // não é a wallet do usuário — só prova "sou sempre o mesmo dono deste
         // nodeId entre sessões", que é tudo que o signaling exige.
         val identity = NodeIdentity.load(applicationContext)
-        Log.d(TAG, "conectando ao signaling $signalingUrl como $nodeId (pubkey=${identity.pubkeyBase58})")
+        Log.d(TAG, "conectando ao signaling federado como $nodeId (pubkey=${identity.pubkeyBase58})")
+
+        val signalerList = SignalerList(
+            storage = object : SignalerStorage {
+                override fun load(): String? = prefs.getString("signalers", null)
+                override fun save(json: String) { prefs.edit().putString("signalers", json).apply() }
+            }
+        )
 
         val sc = SignalingClient(
-            signalingUrl,
+            signalerList,
             nodeId,
             onSignal = { _, _ -> },
             onStateChange = { connected ->
